@@ -35,13 +35,6 @@ pub struct Message {
 }
 
 impl Message {
-    // fn new() -> Message {
-    //     Self {
-    //         role: Role::User,
-    //         content: vec![],
-    //     }
-    // }
-
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -55,16 +48,6 @@ impl Message {
             content: vec![Content::Text { text: text.into() }],
         }
     }
-
-    // pub fn role(mut self, role: Role) -> Self {
-    //     self.role = role;
-    //     self
-    // }
-    //
-    // pub fn content(mut self, text: impl Into<String>) -> Self {
-    //     self.content = vec![Content::Text { text: text.into() }];
-    //     self
-    // }
 }
 
 /// A tool declaration. Nothing implements tools yet, but keeping this on

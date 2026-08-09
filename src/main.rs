@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     // parse args passed
     let args = Args::parse();
-    
+
     // get api key
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable is not set"))?;
@@ -45,33 +45,29 @@ async fn main() -> anyhow::Result<()> {
     // use the provider to instantiate the agent
     let mut agent = Agent::new(provider, args.system, args.max_tokens);
 
-    // 
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
-    // let mut buffer = String::new();
-    
+    // lock lines
+    let mut lines = io::stdin().lock().lines();
 
     loop {
         // print command prompt
         print!("> ");
-        
+
         // flush
         io::stdout().flush()?;
-    
+
         // get line or break;
         let Some(line) = lines.next() else { break };
         let line = line?;
         let trimmed = line.trim();
 
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "/exit" || trimmed == "/quit" {
-            break;
-        }
-
-        if let Err(e) = agent.turn(trimmed).await {
-            eprintln!("error: {e}");
+        match trimmed {
+            "" => continue,
+            "/exit" | "/quit" => break,
+            _ => {
+                if let Err(e) = agent.turn(trimmed).await {
+                    eprintln!("error: {e}");
+                }
+            }
         }
     }
 

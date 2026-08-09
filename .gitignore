@@ -31,3 +31,5 @@ target
 
 
 *.svg
+
+*.log
