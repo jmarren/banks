@@ -74,7 +74,7 @@ impl Provider for ClaudeProvider {
         }
 
         let byte_stream = response.bytes_stream();
-        Ok(stream::full_stream_transform(byte_stream).boxed())
+        Ok(stream::parse_sse(byte_stream).boxed())
         // Ok(stream::parse_sse(byte_stream).boxed())
     }
 }

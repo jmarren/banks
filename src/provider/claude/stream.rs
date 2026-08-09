@@ -8,7 +8,6 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
-use std::pin;
 
 use super::wire::stop_reason_from_wire;
 
@@ -180,7 +179,7 @@ impl Accumulator {
             json_buf: String::new(),
         });
 
-        StreamEvent::ToolUseStart { id: id, name: name }
+        StreamEvent::ToolUseStart { id, name }
     }
 
     /// Opens a new text block, yielding a `TextDelta` immediately if the
@@ -230,9 +229,7 @@ impl Accumulator {
         index: usize,
         delta: ContentDelta,
     ) -> Option<StreamEvent> {
-        let Some(block) = self.blocks.get_mut(index) else {
-            return None;
-        };
+        let block = self.blocks.get_mut(index)?;
 
         match (block, delta) {
             (PendingBlock::Text(text), ContentDelta::TextDelta { text: chunk }) => {
@@ -254,27 +251,28 @@ impl Accumulator {
     }
 }
 
-pub fn full_stream_transform(
-    byte_stream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
-) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send + 'static {
-    transform_handle(stream_extracted(parse_sse(byte_stream)))
-}
-
-/// transforms stream by mapping errors to provider decode errors and omitting empty data
+/// transforms sse st eam into
+/// composes stream transformation functions into a full pipeline
+/// that
 pub fn parse_sse(
     byte_stream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
-) -> pin::Pin<Box<impl Stream<Item = Result<Event, ProviderError>> + Send + 'static>> {
+) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send + 'static {
+    handle_raw_events(extract_raw_events(remove_empty_and_map_errs(byte_stream)))
+}
+
+/// Frames the byte stream as SSE, mapping transport errors and dropping
+/// keep-alive events with empty data. Ends the stream on the first error.
+pub fn remove_empty_and_map_errs(
+    byte_stream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+) -> impl Stream<Item = Result<Event, ProviderError>> + Send + 'static {
     let events = byte_stream
         .map(|res| res.map_err(std::io::Error::other))
         .eventsource();
 
-    Box::pin(async_stream::stream! {
+    async_stream::stream! {
+        let mut events = std::pin::pin!(events);
 
-        let mut pinned_events = Box::pin(events);
-
-        while let Some(event) = pinned_events.next().await {
-
-            // check if the event is an error first
+        while let Some(event) = events.next().await {
             let event = match event {
                 Ok(e) => e,
                 Err(e) => {
@@ -283,25 +281,36 @@ pub fn parse_sse(
                 }
             };
 
-            // if no data continue
             if event.data.is_empty() {
                 continue;
             }
 
             yield Ok(event);
-
         }
-    })
+    }
 }
 
-/// transforms stream by extracting the event data into RawEvents
-fn stream_extracted(
-    mut event_stream: pin::Pin<
-        Box<impl Stream<Item = Result<Event, ProviderError>> + Send + 'static>,
-    >,
-) -> pin::Pin<Box<impl Stream<Item = Result<RawEvent, ProviderError>> + Send + 'static>> {
-    Box::pin(async_stream::stream! {
-        while let Some(Ok(event)) = event_stream.next().await {
+/// Decodes each SSE event's `data` field into a `RawEvent`. Ends the
+/// stream on the first error, whether from upstream or from a decode
+/// failure here.
+fn extract_raw_events(
+    event_stream: impl Stream<Item = Result<Event, ProviderError>> + Send + 'static,
+) -> impl Stream<Item = Result<RawEvent, ProviderError>> + Send + 'static {
+    async_stream::stream! {
+        let mut event_stream = std::pin::pin!(event_stream);
+
+        while let Some(event) = event_stream.next().await {
+
+            // if the event is an error, yield it
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            // extract the data into a RawEvent struct and yield error if returned
             let raw: RawEvent = match serde_json::from_str(&event.data) {
                 Ok(r) => r,
                 Err(e) => {
@@ -310,131 +319,63 @@ fn stream_extracted(
                 }
             };
 
+            // yield RawEvent
             yield Ok(raw);
         }
-    })
+    }
 }
 
-fn transform_handle(
-    mut incoming: pin::Pin<
-        Box<impl Stream<Item = Result<RawEvent, ProviderError>> + Send + 'static>,
-    >,
-) -> pin::Pin<Box<impl Stream<Item = Result<StreamEvent, ProviderError>> + Send + 'static>> {
-    let mut acc = Accumulator::new();
+fn handle_raw_event(acc: &mut Accumulator, out: &mut Option<StreamEvent>, event: RawEvent) {
+    match event {
+        RawEvent::MessageStart { message } => acc.handle_message_start(message),
+        RawEvent::ContentBlockStart {
+            index,
+            content_block,
+        } => {
+            *out = acc.handle_content_block_start_event(index, content_block);
+        }
+        RawEvent::ContentBlockDelta { index, delta } => {
+            *out = acc.handle_content_block_delta(index, delta);
+        }
+        RawEvent::ContentBlockStop { .. } => {}
+        RawEvent::MessageDelta { delta } => acc.handle_message_delta(delta),
+        RawEvent::Ping | RawEvent::Unknown => {}
+        _ => (),
+    };
+}
 
-    Box::pin(async_stream::stream! {
-        while let Some(Ok(event)) = incoming.next().await {
+/// Accumulates `RawEvent`s into `StreamEvent`s, yielding incremental
+/// events live and a final `MessageDone` on `message_stop`. Ends the
+/// stream on the first error from upstream.
+fn handle_raw_events(
+    incoming: impl Stream<Item = Result<RawEvent, ProviderError>> + Send + 'static,
+) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send + 'static {
+    async_stream::stream! {
+        let mut incoming = std::pin::pin!(incoming);
+        let mut acc = Accumulator::new();
+
+        while let Some(event) = incoming.next().await {
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
             let mut out: Option<StreamEvent> = None;
             match event {
-                RawEvent::MessageStart { message } => acc.handle_message_start(message),
-                RawEvent::ContentBlockStart { index, content_block } => {
-                    out = acc.handle_content_block_start_event(index, content_block);
-                }
-                RawEvent::ContentBlockDelta { index, delta } => {
-                    out = acc.handle_content_block_delta(index, delta);
-                },
-                RawEvent::ContentBlockStop { .. } => {}
-                RawEvent::MessageDelta { delta } => acc.handle_message_delta(delta),
                 RawEvent::MessageStop => {
                     let response = std::mem::replace(&mut acc, Accumulator::new()).finish();
                     yield Ok(StreamEvent::MessageDone(response));
                     return;
                 }
-                RawEvent::Ping | RawEvent::Unknown => {}
+                _ => handle_raw_event(&mut acc, &mut out, event),
             };
 
             if let Some(result) = out {
                 yield Ok(result);
             }
         }
-    })
+    }
 }
-
-// // extract the event data into the RawEvent struct
-
-// map any errors
-/*
-/// Parses a Claude SSE byte stream into `StreamEvent`s, yielding
-/// `TextDelta`/`ToolUseStart`/`ToolInputDelta` incrementally as events
-/// arrive, then a final `MessageDone` on `message_stop`. Ends the stream
-/// (returns) on the first parse or transport error, or once `MessageDone`
-/// is yielded.
-/// */
-// pub fn parse_sse(
-//     byte_stream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
-// ) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send + 'static {
-//     // map any errors
-//     // and get the eventsource
-//     let events = byte_stream
-//         .map(|res| res.map_err(std::io::Error::other))
-//         .eventsource();
-//
-//     async_stream::stream! {
-//         let mut acc = Accumulator::new();
-//         // futures_util::pin_mut!(events);
-//         let mut pinned_events = Box::pin(events);
-//
-//         while let Some(event) = pinned_events.next().await {
-//
-//             // check if the event is an error first
-//             let event = match event {
-//                 Ok(e) => e,
-//                 Err(e) => {
-//                     yield Err(ProviderError::Decode(e.to_string()));
-//                     return;
-//                 }
-//             };
-//
-//             // if no data continue
-//             if event.data.is_empty() {
-//                 continue;
-//             }
-//
-//             // TEMP DEBUG — dump raw SSE payloads for inspection; remove before merging.
-//             {
-//                 use std::io::Write as _;
-//                 if let Ok(mut f) = std::fs::OpenOptions::new()
-//                     .create(true)
-//                     .append(true)
-//                     .open("banks_sse_raw.log")
-//                 {
-//                     let _ = writeln!(f, "{}", event.data);
-//                 }
-//             }
-//
-//             // extract the event data into the RawEvent struct
-//             let raw: RawEvent = match serde_json::from_str(&event.data) {
-//                 Ok(r) => r,
-//                 Err(e) => {
-//                     yield Err(ProviderError::Decode(e.to_string()));
-//                     return;
-//                 }
-//             };
-//
-//             let mut out: Option<StreamEvent> = None;
-//
-//             match raw {
-//                 RawEvent::MessageStart { message } => acc.handle_message_start(message),
-//                 RawEvent::ContentBlockStart { index, content_block } => {
-//                     out = acc.handle_content_block_start_event(index, content_block);
-//                 }
-//                 RawEvent::ContentBlockDelta { index, delta } => {
-//                     out = acc.handle_content_block_delta(index, delta);
-//                 },
-//                 RawEvent::ContentBlockStop { .. } => {}
-//                 RawEvent::MessageDelta { delta } => acc.handle_message_delta(delta),
-//                 RawEvent::MessageStop => {
-//                     let response = std::mem::replace(&mut acc, Accumulator::new()).finish();
-//                     yield Ok(StreamEvent::MessageDone(response));
-//                     return;
-//                 }
-//                 RawEvent::Ping | RawEvent::Unknown => {}
-//             };
-//
-//             if let Some(result) = out {
-//                 yield Ok(result);
-//             }
-//
-//         }
-//     }
-// }
