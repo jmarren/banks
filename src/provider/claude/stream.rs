@@ -249,11 +249,38 @@ impl Accumulator {
             _ => None,
         }
     }
+
+    /// Dispatches a `RawEvent` other than `MessageStop` to its handler.
+    /// `MessageStop` is handled by the caller, since it needs to finish
+    /// and replace the accumulator rather than mutate it in place.
+    fn handle_raw_event(&mut self, event: RawEvent) -> Option<StreamEvent> {
+        match event {
+            RawEvent::MessageStart { message } => {
+                self.handle_message_start(message);
+                None
+            }
+            RawEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => self.handle_content_block_start_event(index, content_block),
+            RawEvent::ContentBlockDelta { index, delta } => {
+                self.handle_content_block_delta(index, delta)
+            }
+            RawEvent::ContentBlockStop { .. } => None,
+            RawEvent::MessageDelta { delta } => {
+                self.handle_message_delta(delta);
+                None
+            }
+            RawEvent::Ping | RawEvent::Unknown => None,
+            // unreachable — the caller strips MessageStop out before delegating here
+            RawEvent::MessageStop => None,
+        }
+    }
 }
 
-/// transforms sse st eam into
-/// composes stream transformation functions into a full pipeline
-/// that
+/// Composes the SSE parsing pipeline: frames the byte stream as SSE,
+/// decodes each event into a `RawEvent`, then accumulates those into
+/// `StreamEvent`s.
 pub fn parse_sse(
     byte_stream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
 ) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send + 'static {
@@ -325,25 +352,6 @@ fn extract_raw_events(
     }
 }
 
-fn handle_raw_event(acc: &mut Accumulator, out: &mut Option<StreamEvent>, event: RawEvent) {
-    match event {
-        RawEvent::MessageStart { message } => acc.handle_message_start(message),
-        RawEvent::ContentBlockStart {
-            index,
-            content_block,
-        } => {
-            *out = acc.handle_content_block_start_event(index, content_block);
-        }
-        RawEvent::ContentBlockDelta { index, delta } => {
-            *out = acc.handle_content_block_delta(index, delta);
-        }
-        RawEvent::ContentBlockStop { .. } => {}
-        RawEvent::MessageDelta { delta } => acc.handle_message_delta(delta),
-        RawEvent::Ping | RawEvent::Unknown => {}
-        _ => (),
-    };
-}
-
 /// Accumulates `RawEvent`s into `StreamEvent`s, yielding incremental
 /// events live and a final `MessageDone` on `message_stop`. Ends the
 /// stream on the first error from upstream.
@@ -363,19 +371,18 @@ fn handle_raw_events(
                 }
             };
 
-            let mut out: Option<StreamEvent> = None;
             match event {
                 RawEvent::MessageStop => {
                     let response = std::mem::replace(&mut acc, Accumulator::new()).finish();
                     yield Ok(StreamEvent::MessageDone(response));
                     return;
                 }
-                _ => handle_raw_event(&mut acc, &mut out, event),
+                _ => {
+                    if let Some(result) = acc.handle_raw_event(event) {
+                        yield Ok(result);
+                    }
+                }
             };
-
-            if let Some(result) = out {
-                yield Ok(result);
-            }
         }
     }
 }
